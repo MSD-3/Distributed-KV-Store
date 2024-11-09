@@ -15,6 +15,7 @@
 #include <cstring>
 #include <chrono>
 #include <functional>
+#include <iomanip>
 
 #define NUM_NODES 10
 #define DATA "organizations.csv"
@@ -29,6 +30,11 @@ private:
     mutable list<pair<K, V>> items;
     mutable unordered_map<K, typename list<pair<K, V>>::iterator> cache;
 
+    //cache statistics tracker
+    mutable uint64_t cache_accesses{0};
+    mutable uint64_t cache_hits{0};
+    mutable uint64_t cache_misses{0};
+
     //helper function to update LRU order
     void touch(typename unordered_map<K, typename list<pair<K, V>>::iterator>::iterator cache_it) const {
         //move the accessed item to front of the list
@@ -41,7 +47,7 @@ private:
 
 public:
     explicit LRUCache(int size) : capacity(size) {}
-
+    //put function for cache
     void put(const K& key, const V& value) {
         lock_guard<mutex> lock(cache_mutex);
         auto it = cache.find(key);
@@ -61,35 +67,72 @@ public:
             cache[key] = items.begin();
         }
     }
-
-    pair<bool, V> get(const K& key) const {
+    //get function for cache
+     pair<bool, V> get(const K& key) const {
         lock_guard<mutex> lock(cache_mutex);
-        auto it = cache.find(key);
+        cache_accesses++;
         
+        auto it = cache.find(key);
         if (it == cache.end()) {
+            cache_misses++;
             return {false, V()};
         }
-        
+        cache_hits++;
         auto value = it->second->second;
         touch(it);
         return {true, value};
     }
-
+    //checks if key is present in cache
     bool contains(const K& key) const {
         lock_guard<mutex> lock(cache_mutex);
         return cache.find(key) != cache.end();
     }
-
+    //returns cache size
     int size() const {
         lock_guard<mutex> lock(cache_mutex);
         return cache.size();
     }
-
+    //clears cache
     void clear() {
         lock_guard<mutex> lock(cache_mutex);
         items.clear();
         cache.clear();
     }
+
+    //get cache contents    
+     vector<tuple<K, V, int >> getCacheContents() const {
+        lock_guard<mutex> lock(cache_mutex);
+        vector<tuple<K, V, int >> contents;
+        int  lru_position = 0;
+        
+        for (const auto& item : items) {
+            contents.emplace_back(item.first, item.second, lru_position++);
+        }
+        return contents;
+    }
+
+    //get cache accesses
+     uint64_t getAccesses() const {
+        lock_guard<mutex> lock(cache_mutex);
+        return cache_accesses;
+    }
+    //get cache hits
+    uint64_t getHits() const {
+        lock_guard<mutex> lock(cache_mutex);
+        return cache_hits;
+    }
+    //get cache misses
+    uint64_t getMisses() const {
+        lock_guard<mutex> lock(cache_mutex);
+        return cache_misses;
+    }
+    //get cache MPKI
+    double getMPKI() const {
+        lock_guard<mutex> lock(cache_mutex);
+        if (cache_accesses == 0) return 0.0;
+        return (cache_misses * 1000.0) / cache_accesses;
+    }
+    
 };
 class Node {
 private:
@@ -222,11 +265,11 @@ bool set(const string& key, const string& value) {
     }
 }
     
-    pair<size_t, size_t> getKeyRange() const {
-            int rangeSize = numeric_limits<size_t>::max() / totalNodes;
+    pair<int , int > getKeyRange() const {
+            int rangeSize = numeric_limits<int >::max() / totalNodes;
             int start = nodeId * rangeSize;
             int end = (nodeId == totalNodes - 1) ? 
-                        numeric_limits<size_t>::max() : 
+                        numeric_limits<int >::max() : 
                         start + rangeSize - 1;
             return {start, end};
         }
@@ -244,6 +287,26 @@ bool set(const string& key, const string& value) {
     int getCacheSize() const {
         return cache.size();
     }
+
+    void printCacheStats() const {
+    cout << "\n=== Cache Statistics for Node " << nodeId << " ===\n";
+    cout << "Cache Size: " << cache.size() << "/" << getCacheSize() << "\n";
+    cout << "Total Accesses: " << cache.getAccesses() << "\n";
+    cout << "Cache hits: " << cache.getHits() << "\n";
+    cout << "Cache Misses: " << cache.getMisses() << "\n";
+    cout << "Cache MPKI (Misses Per Kilo Instructions): " << fixed << setprecision(2) << cache.getMPKI() << "\n\n";
+    
+    cout << "Cache Contents (LRU order - 0 is most recently used):\n";
+    cout << setw(20) << "Key"<< " | " << "LRU Position\n";
+    cout << string(60, '-') << "\n";
+    
+    auto contents = cache.getCacheContents();
+    for (const auto& [key, value, lru_pos] : contents) {
+        cout << setw(20) << key << " | " 
+                  << lru_pos << "\n";
+    }
+    cout << string(60, '-') << "\n";
+}
 
     //shows all the storage contents of the node
     void dumpStorage() const {
@@ -286,7 +349,7 @@ bool set(const string& key, const string& value) {
             getline(iss, value, ':');
             getline(iss, version);
             
-            // Remove any whitespace
+            //remove any whitespace
             key.erase(remove_if(key.begin(), key.end(), 
                      [](unsigned char c) { return isspace(c); }), key.end());
             
@@ -294,7 +357,7 @@ bool set(const string& key, const string& value) {
             
             bool success = set(key, value);
             
-            // Always send an acknowledgment
+            //send an acknowledgment
             const char* response = success ? "ACK" : "NAK";
             send(clientSocket, response, strlen(response), 0);
             
@@ -550,11 +613,11 @@ private:
                   << "PUT <key> <value>   - Store key-value pair\n"
                   << "DELETE <key>        - Delete key-value pair\n"
                   << "STATUS              - Show cluster status\n"
+                  << "CACHE <node_id>     - Show cache statistics for specific node\n"
                   << "DUMP                - Show all stored data\n"
                   << "HELP                - Show this help message\n"
                   << "EXIT                - Exit the program\n"
-                  << "=====================================\n";
-    
+                  << "==============================================\n";
     }
 
     void showStatus() {
@@ -714,11 +777,20 @@ public:
                 else if (command == "STATUS") {
                     showStatus();
                 }
+                else if (command == "CACHE") {
+                    int nodeId;
+                    if (!(iss >> nodeId) || nodeId < 0 || nodeId >= totalNodes) {
+                        cout << "Error: CACHE requires a valid node ID (0-" << (totalNodes-1) << ")\n";
+                        continue;
+                    }
+                    nodes[nodeId]->printCacheStats();
+                }
                 else if (command == "HELP") {
                     printHelp();
                 }
                 else if (command == "EXIT") {
                     cout << "Shutting down...\n";
+                    exit();
                     break;
                 }
                 else {
@@ -743,7 +815,6 @@ public:
 
 int main() {
     try {
-        // Increase the initial delay to ensure proper initialization
         cout << "Starting cluster...\n";
         KVStoreInterface interface(NUM_NODES);
         cout << "Cluster started successfully.\n";
