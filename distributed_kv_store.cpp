@@ -421,7 +421,22 @@ bool redirectSet(const string& key, const string& value) {
                 send(clientSocket, result.c_str(), result.length(), 0);
             }
             else if (cmd == "SET") {
-                // ... (SET handling remains the same)
+                getline(iss, key, ':');
+            getline(iss, value);
+            
+            //remove any whitespace
+            key.erase(remove_if(key.begin(), key.end(), 
+                     [](unsigned char c) { return isspace(c); }), key.end());
+            
+            //cout << "Debug: Node " << nodeId << " processing SET request for key: '" << key << "' value: '" << value << "'" << endl;
+            
+            bool success = set(key, value);
+            
+            //always send an acknowledgment
+            const char* response = success ? "ACK" : "NAK";
+            send(clientSocket, response, strlen(response), 0);
+            
+            //cout << "Debug: Node " << nodeId << " sent response: " << response << endl;
             }
         }
         catch (const exception& e) {
@@ -592,6 +607,7 @@ class KVStoreInterface {
 private:
     vector<unique_ptr<Node>> nodes;
     int totalNodes;
+    int currentNode;
 
     void printHelp() {
         cout << "\n=== Distributed Key-Value Store Commands ===\n"
@@ -601,6 +617,8 @@ private:
                   << "STATUS              - Show cluster status\n"
                   << "CACHE <node_id>     - Show cache statistics for specific node\n"
                   << "DUMP                - Show all stored data\n"
+                  << "USE <node_id>       - Switch to specific node for sending requests\n"
+                  << "NODE                - Show currently selected node\n"
                   << "HELP                - Show this help message\n"
                   << "EXIT                - Exit the program\n"
                   << "==============================================\n";
@@ -633,7 +651,7 @@ private:
     }
 
 public:
-    KVStoreInterface(int numNodes = 3) : totalNodes(numNodes) {
+    KVStoreInterface(int numNodes = 10) : totalNodes(numNodes), currentNode(0) {
         initializeCluster();
     }
     
@@ -676,7 +694,7 @@ public:
         printHelp();
 
         while (true) {
-            cout << "\n> ";
+            cout << "\nNode[" << currentNode << "]> ";
             getline(cin, line);
             
             if (line.empty()) continue;
@@ -690,7 +708,21 @@ public:
             }
 
             try {
-                if (command == "DUMP") {
+                if (command == "USE") {
+                    int nodeId;
+                    if (!(iss >> nodeId) || nodeId < 0 || nodeId >= totalNodes) {
+                        cout << "Error: Invalid node ID. Must be between 0 and " 
+                                << (totalNodes - 1) << "\n";
+                        continue;
+                    }
+                    currentNode = nodeId;
+                    cout << "Switched to Node " << currentNode << "\n";
+                }
+                else if (command == "NODE") {
+                    cout << "Currently using Node " << currentNode 
+                            << " (Port " << (8081 + currentNode) << ")\n";
+                }
+                else if (command == "DUMP") {
                     for (int i = 0; i < nodes.size(); i++) {
                         nodes[i]->dumpStorage();
                     }
@@ -703,7 +735,7 @@ public:
                     }
 
                     auto start = chrono::high_resolution_clock::now();
-                    string value = nodes[0]->get(key); 
+                    string value = nodes[currentNode]->get(key); 
                     auto end = chrono::high_resolution_clock::now();
                     auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
@@ -714,7 +746,6 @@ public:
                     }
                     cout << "Operation took " << duration.count() << " microseconds\n";
                 }
-                
                 else if (command == "PUT") {
                     string key, value;
                     if (!(iss >> key)) {
@@ -729,7 +760,7 @@ public:
                     }
 
                     auto start = chrono::high_resolution_clock::now();
-                    bool success = nodes[0]->set(key, value); 
+                    bool success = nodes[currentNode]->set(key, value);
                     auto end = chrono::high_resolution_clock::now();
                     auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
@@ -748,7 +779,7 @@ public:
                     }
 
                     auto start = chrono::high_resolution_clock::now();
-                    bool success = nodes[0]->set(key, ""); 
+                    bool success = nodes[currentNode]->set(key, "");
                     auto end = chrono::high_resolution_clock::now();
                     auto duration = chrono::duration_cast<chrono::microseconds>(end - start);
 
@@ -765,7 +796,8 @@ public:
                 else if (command == "CACHE") {
                     int nodeId;
                     if (!(iss >> nodeId) || nodeId < 0 || nodeId >= totalNodes) {
-                        cout << "Error: CACHE requires a valid node ID (0-" << (totalNodes-1) << ")\n";
+                        cout << "Error: CACHE requires a valid node ID (0-" 
+                                << (totalNodes-1) << ")\n";
                         continue;
                     }
                     nodes[nodeId]->printCacheStats();
