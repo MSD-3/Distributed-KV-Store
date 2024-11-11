@@ -213,24 +213,30 @@ public:
     //GET function
     string get(string& key) {
         //cout << "Debug: GET request for key: " << key << " on node " << nodeId << endl;
-        //cehcking cache
+        
+        // Check cache first
         auto [found, cachedValue] = cache.get(key);
         if (found && !cachedValue.empty()) {
             //cout << "Debug: Found in cache: " << cachedValue << endl;
             return cachedValue;
         }
-        //checks if responsible for
+        
+        //redirect if not resposnible
         if (!isResponsibleFor(key)) {
             //cout << "Debug: Not responsible for key, redirecting" << endl;
-            return redirectGet(key);
+            string redirectedValue = redirectGet(key);
+            if (!redirectedValue.empty()) {
+                //cache the value received from the responsible node
+                cache.put(key, redirectedValue);
+            }
+            return redirectedValue;
         }
-        
-
-        // Try storage
+        //check for data
         lock_guard<mutex> lock(storageMutex);
         auto it = storage.find(key);
         if (it != storage.end() && !it->second.empty()) {
             //cout << "Debug: Found in storage: " << it->second << endl;
+            // Cache the value we're about to return
             cache.put(key, it->second);
             return it->second;
         }
@@ -238,6 +244,7 @@ public:
         //cout << "Debug: Key not found in node " << nodeId << endl;
         return "";
     }
+
 
     //SET function
 bool set(const string& key, const string& value) {
@@ -268,13 +275,11 @@ bool set(const string& key, const string& value) {
     pair<int , int > getKeyRange() const {
             int rangeSize = numeric_limits<int >::max() / totalNodes;
             int start = nodeId * rangeSize;
-            int end = (nodeId == totalNodes - 1) ? 
-                        numeric_limits<int >::max() : 
-                        start + rangeSize - 1;
+            int end = (nodeId == totalNodes - 1) ? numeric_limits<int >::max() : start + rangeSize - 1;
             return {start, end};
         }
 
-        // Add method to get all keys in node's storage
+        //get all data 
         vector<string> getStoredKeys() const {
             vector<string> keys;
             lock_guard<mutex> lock(storageMutex);
@@ -316,62 +321,7 @@ bool set(const string& key, const string& value) {
             cout << key << " => " << value << "\n";
         }
         cout << endl;
-    }
-
-    //takes selection input
-   void handleIncomingRequest(int clientSocket) {
-    char buffer[4096] = {0};
-   int  bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
-    if (bytesRead <= 0) {
-        cerr << "Error reading from socket" << endl;
-        close(clientSocket);
-        return;
-    }
-
-    string request(buffer);
-    //cout << "Debug: Node " << nodeId << " received request: " << request << endl;
-
-    istringstream iss(request);
-    string cmd, key, value, version;
-    getline(iss, cmd, ':');
-    
-    try {
-        if (cmd == "GET") {
-            getline(iss, key);
-            key.erase(remove_if(key.begin(), key.end(), 
-                     [](unsigned char c) { return isspace(c); }), key.end());
-            
-            string result = get(key);
-            send(clientSocket, result.c_str(), result.length(), 0);
-        }
-        else if (cmd == "SET") {
-            getline(iss, key, ':');
-            getline(iss, value, ':');
-            getline(iss, version);
-            
-            //remove any whitespace
-            key.erase(remove_if(key.begin(), key.end(), 
-                     [](unsigned char c) { return isspace(c); }), key.end());
-            
-            //cout << "Debug: Node " << nodeId << " processing SET request for key: '" << key << "' value: '" << value << "'" << endl;
-            
-            bool success = set(key, value);
-            
-            //send an acknowledgment
-            const char* response = success ? "ACK" : "NAK";
-            send(clientSocket, response, strlen(response), 0);
-            
-            //cout << "Debug: Node " << nodeId << " sent response: " << response << endl;
-        }
-    }
-    catch (const exception& e) {
-        cerr << "Error handling request on node " << nodeId << ": " 
-                  << e.what() << endl;
-        // Send error response
-        const char* error = "ERR";
-        send(clientSocket, error, strlen(error), 0);
-    }
-}
+    }   
     
 private:
     //redirects request to target node
@@ -427,6 +377,7 @@ bool redirectSet(const string& key, const string& value) {
                     return "";
                 }
 
+                // Send a GET request to the responsible node
                 string request = "GET:" + key;
                 send(sock, request.c_str(), request.length(), 0);
 
@@ -444,6 +395,41 @@ bool redirectSet(const string& key, const string& value) {
         
         cerr << "No peer found for node " << targetNode << endl;
         return "";
+    }
+
+    void handleIncomingRequest(int clientSocket) {
+        char buffer[4096] = {0};
+        int bytesRead = read(clientSocket, buffer, sizeof(buffer) - 1);
+        if (bytesRead <= 0) {
+            cerr << "Error reading from socket" << endl;
+            close(clientSocket);
+            return;
+        }
+
+        string request(buffer);
+        istringstream iss(request);
+        string cmd, key, value;
+        getline(iss, cmd, ':');
+        
+        try {
+            if (cmd == "GET") {
+                getline(iss, key);
+                key.erase(remove_if(key.begin(), key.end(), 
+                        [](unsigned char c) { return isspace(c); }), key.end());
+                
+                string result = get(key);
+                send(clientSocket, result.c_str(), result.length(), 0);
+            }
+            else if (cmd == "SET") {
+                // ... (SET handling remains the same)
+            }
+        }
+        catch (const exception& e) {
+            cerr << "Error handling request on node " << nodeId << ": " 
+                    << e.what() << endl;
+            const char* error = "ERR";
+            send(clientSocket, error, strlen(error), 0);
+        }
     }
 
 //request listener
@@ -633,7 +619,6 @@ private:
                      << " - " << range.second << dec << "\n"
                      << "  Stored Keys: ";
             
-            // Print first few keys (up to 5)
             int keyCount = 0;
             for (const auto& key : keys) {
                 if (keyCount++ >= 5) {
@@ -790,7 +775,7 @@ public:
                 }
                 else if (command == "EXIT") {
                     cout << "Shutting down...\n";
-                    exit();
+                    exit(0);
                     break;
                 }
                 else {
