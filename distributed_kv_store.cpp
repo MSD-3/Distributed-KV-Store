@@ -132,6 +132,13 @@ public:
         if (cache_accesses == 0) return 0.0;
         return (cache_misses * 1000.0) / cache_accesses;
     }
+
+    void invalidateEntry(K& key){
+        if(contains(key)){
+            //cout<<"Removed stale key\n";
+            cache.erase(key);
+        }
+    }
     
 };
 class Node {
@@ -252,6 +259,8 @@ bool set(const string& key, const string& value) {
     //cout << "Debug: Hash of key: " << hasher(key) << endl;
     //cout << "Debug: Total nodes: " << totalNodes << endl;
     //cout << "Debug: Responsible node: " << (hasher(key) % totalNodes) << endl;
+    cache.put(key, value);
+    updateVersions[key] = ++currentVersion;
 
     if (!isResponsibleFor(key)) {
         //cout << "Debug: Not responsible for key, redirecting to correct node" << endl;
@@ -261,8 +270,7 @@ bool set(const string& key, const string& value) {
     try {
         lock_guard<mutex> lock(storageMutex);
         storage[key] = value;
-        cache.put(key, value);
-        updateVersions[key] = ++currentVersion;
+        broadcastInvalidation(key);
         
         //cout << "Debug: Successfully stored value locally" << endl;
         return true;
@@ -291,6 +299,37 @@ bool set(const string& key, const string& value) {
 
     int getCacheSize() const {
         return cache.size();
+    }
+
+    void broadcastInvalidation(const string& key) {
+        //cout << "Debug: Broadcasting cache invalidation for key: " << key << endl;
+        for (const auto& peer : peers) {
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0) continue;
+
+            struct timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            sockaddr_in peerAddr{};
+            peerAddr.sin_family = AF_INET;
+            peerAddr.sin_port = htons(peer.second);
+            if (inet_pton(AF_INET, peer.first.c_str(), &peerAddr.sin_addr) <= 0) {
+                close(sock);
+                continue;
+            }
+
+            if (connect(sock, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
+                close(sock);
+                continue;
+            }
+
+            string invalidateMsg = "INVALIDATE:" + key;
+            send(sock, invalidateMsg.c_str(), invalidateMsg.length(), 0);
+            close(sock);
+        }
     }
 
     void printCacheStats() const {
@@ -412,7 +451,18 @@ bool redirectSet(const string& key, const string& value) {
         getline(iss, cmd, ':');
         
         try {
-            if (cmd == "GET") {
+
+            if (cmd == "INVALIDATE") {
+                getline(iss, key);
+                // remove whitespace
+                key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) { return isspace(c); }), key.end());
+                
+                //invalidate the cache entry
+                cache.invalidateEntry(key);
+                const char* ack = "ACK";
+                send(clientSocket, ack, strlen(ack), 0);
+            }
+            else if (cmd == "GET") {
                 getline(iss, key);
                 key.erase(remove_if(key.begin(), key.end(), 
                         [](unsigned char c) { return isspace(c); }), key.end());
@@ -422,21 +472,21 @@ bool redirectSet(const string& key, const string& value) {
             }
             else if (cmd == "SET") {
                 getline(iss, key, ':');
-            getline(iss, value);
-            
-            //remove any whitespace
-            key.erase(remove_if(key.begin(), key.end(), 
-                     [](unsigned char c) { return isspace(c); }), key.end());
-            
-            //cout << "Debug: Node " << nodeId << " processing SET request for key: '" << key << "' value: '" << value << "'" << endl;
-            
-            bool success = set(key, value);
-            
-            //always send an acknowledgment
-            const char* response = success ? "ACK" : "NAK";
-            send(clientSocket, response, strlen(response), 0);
-            
-            //cout << "Debug: Node " << nodeId << " sent response: " << response << endl;
+                getline(iss, value, ':');
+                //getline(iss, "");
+                
+                //remove any whitespace
+                key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) { return isspace(c); }), key.end());
+                
+                //cout << "Debug: Node " << nodeId << " processing SET request for key: '" << key << "' value: '" << value << "'" << endl;
+                
+                bool success = set(key, value);
+                
+                //always send an acknowledgment
+                const char* response = success ? "ACK" : "NAK";
+                send(clientSocket, response, strlen(response), 0);
+                
+                //cout << "Debug: Node " << nodeId << " sent response: " << response << endl;
             }
         }
         catch (const exception& e) {
