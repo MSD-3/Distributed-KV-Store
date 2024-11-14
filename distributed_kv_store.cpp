@@ -16,11 +16,62 @@
 #include <chrono>
 #include <functional>
 #include <iomanip>
+#include <future>
+#include <queue>
 
-#define NUM_NODES 10
+#define NUM_NODES 1000
 #define DATA "organizations.csv"
 
 using namespace std;
+
+class ThreadPool {
+private:
+    vector<thread> workers;
+    queue<function<void()>> tasks;
+    mutex queue_mutex;
+    condition_variable condition;
+    bool stop;
+
+public:
+    explicit ThreadPool(size_t threads) : stop(false) {
+        for(size_t i = 0; i < threads; ++i)
+            workers.emplace_back([this] {
+                while(true) {
+                    function<void()> task;
+                    {
+                        unique_lock<mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { 
+                            return stop || !tasks.empty(); 
+                        });
+                        if(stop && tasks.empty())
+                            return;
+                        task = move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            tasks.emplace(forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        {
+            unique_lock<mutex> lock(queue_mutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for(thread &worker: workers)
+            worker.join();
+    }
+};
 
 template<typename K, typename V>
 class LRUCache {
@@ -658,6 +709,7 @@ private:
     vector<unique_ptr<Node>> nodes;
     int totalNodes;
     int currentNode;
+    mutex nodesMutex;
 
     void printHelp() {
         cout << "\n=== Distributed Key-Value Store Commands ===\n"
@@ -706,38 +758,72 @@ public:
     }
     
     //function to initialse cluster
-     void initializeCluster() {
+    void initializeCluster() {
         cout << "Initializing cluster with " << totalNodes << " nodes...\n";
+        auto start = chrono::high_resolution_clock::now();
 
-        //create nodes
-        for (int i = 0; i < totalNodes; i++) {
-            nodes.push_back(make_unique<Node>(8081 + i, 10, i, totalNodes));
-        }
+        //create thread pool with hw threads
+        const int num_threads = thread::hardware_concurrency();
+        ThreadPool pool(num_threads);
+        vector<future<void>> futures;
 
-        //add peers to each node
+        nodes.resize(totalNodes);
+        
+        mutex cout_mutex;
         for (int i = 0; i < totalNodes; i++) {
-            for (int j = 0; j < totalNodes; j++) {
-                if (i != j) {
-                    //cout << "Node " << i << " adding peer node " << j << endl;
-                    nodes[i]->addPeer("127.0.0.1", 8081 + j);
+            futures.push_back(async(launch::async, [this, i, &cout_mutex]() {
+                nodes[i] = make_unique<Node>(8081 + i, 10, i, totalNodes);
+                {
+                    lock_guard<mutex> lock(cout_mutex);
+                    cout << "Created node " << i << endl;
                 }
-            }
+            }));
         }
 
-        // Print peer configuration for verification
-        // for (int i = 0; i < totalNodes; i++) {
-        //     nodes[i]->printPeers();
-        // }
+        //waiting to finish node creation
+        for (auto& future : futures) {
+            future.wait();
+        }
+        futures.clear();
 
-        //load initial data
-        for (auto& node : nodes) {
-            node->loadFromCSV(DATA);
+
+        vector<promise<void>> promises(totalNodes);
+        for (int i = 0; i < totalNodes; i++) {
+            pool.enqueue([this, i, &promises]() {
+                for (int j = 0; j < totalNodes; j++) {
+                    if (i != j) {
+                        nodes[i]->addPeer("127.0.0.1", 8081 + j);
+                    }
+                }
+                promises[i].set_value();
+            });
         }
 
-        //wait for nodes to initialize
-        this_thread::sleep_for(chrono::milliseconds(500));
-        cout << "Cluster initialized successfully!\n";
+        for (auto& promise : promises) {
+            promise.get_future().wait();
+        }
+
+        //loading data in parallel
+        vector<promise<void>> data_promises(totalNodes);
+        for (int i = 0; i < totalNodes; i++) {
+            pool.enqueue([this, i, &data_promises]() {
+                nodes[i]->loadFromCSV(DATA);
+                data_promises[i].set_value();
+            });
+        }
+
+        //waiting for data loading to complete
+        for (auto& promise : data_promises) {
+            promise.get_future().wait();
+        }
+
+        this_thread::sleep_for(chrono::milliseconds(100));
+
+        auto end = chrono::high_resolution_clock::now();
+        auto duration = chrono::duration_cast<chrono::milliseconds>(end - start);
+        cout << "Cluster initialized successfully in " << duration.count() << "ms!\n";
     }
+
 
    void startInterface() {
         string line;
