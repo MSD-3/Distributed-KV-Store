@@ -19,7 +19,12 @@
 #include <future>
 #include <queue>
 
-#define NUM_NODES 1000
+//tuneables
+#define NUM_NODES 100
+#define CACHE_SIZE 3000
+#define NUM_INIT_POOL 10
+#define NUM_REQUEST_POOL 16
+
 #define DATA "organizations.csv"
 
 using namespace std;
@@ -209,9 +214,12 @@ private:
     int totalNodes;
     hash<string> hasher;
 
+    //worker pool for request handling
+    unique_ptr<ThreadPool> requestPool;
+
 public:
     //constructor
-    Node(int listenPort, int cacheSize, int id, int total) : cache(cacheSize), port(listenPort), isRunning(true), currentVersion(0),nodeId(id), totalNodes(total) {
+    Node(int listenPort, int cacheSize, int id, int total) : cache(cacheSize), port(listenPort), isRunning(true), currentVersion(0),nodeId(id), totalNodes(total), requestPool(make_unique<ThreadPool>(NUM_REQUEST_POOL)) {
         listenerThread = thread(&Node::startListener, this);
         this_thread::sleep_for(chrono::milliseconds(100));
     }
@@ -355,32 +363,33 @@ bool set(const string& key, const string& value) {
     void broadcastInvalidation(const string& key) {
         //cout << "Debug: Broadcasting cache invalidation for key: " << key << endl;
         for (const auto& peer : peers) {
-            int sock = socket(AF_INET, SOCK_STREAM, 0);
-            if (sock < 0) continue;
+            requestPool->enqueue([this, peer, key]() {
+                int sock = socket(AF_INET, SOCK_STREAM, 0);
+                if (sock < 0) return;
 
-            struct timeval tv;
-            tv.tv_sec = 1;
-            tv.tv_usec = 0;
-            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                struct timeval tv;
+                tv.tv_sec = 1;
+                tv.tv_usec = 0;
+                setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            sockaddr_in peerAddr{};
-            peerAddr.sin_family = AF_INET;
-            peerAddr.sin_port = htons(peer.second);
-            if (inet_pton(AF_INET, peer.first.c_str(), &peerAddr.sin_addr) <= 0) {
+                sockaddr_in peerAddr{};
+                peerAddr.sin_family = AF_INET;
+                peerAddr.sin_port = htons(peer.second);
+                if (inet_pton(AF_INET, peer.first.c_str(), &peerAddr.sin_addr) <= 0) {
+                    close(sock);
+                    return;
+                }
+
+                if (connect(sock, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
+                    close(sock);
+                    return;
+                }
+
+                string invalidateMsg = "INVALIDATE:" + key;
+                send(sock, invalidateMsg.c_str(), invalidateMsg.length(), 0);
                 close(sock);
-                continue;
-            }
-
-            if (connect(sock, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) < 0) {
-                close(sock);
-                continue;
-            }
-
-            string invalidateMsg = "INVALIDATE:" + key;
-            send(sock, invalidateMsg.c_str(), invalidateMsg.length(), 0);
-            close(sock);
-        }
+            });        }
     }
 
     void printCacheStats() const {
@@ -515,8 +524,7 @@ bool redirectSet(const string& key, const string& value) {
             }
             else if (cmd == "GET") {
                 getline(iss, key);
-                key.erase(remove_if(key.begin(), key.end(), 
-                        [](unsigned char c) { return isspace(c); }), key.end());
+                key.erase(remove_if(key.begin(), key.end(), [](unsigned char c) { return isspace(c); }), key.end());
                 
                 string result = get(key);
                 send(clientSocket, result.c_str(), result.length(), 0);
@@ -579,61 +587,14 @@ void startListener() {
             int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientLen);
             if (clientSocket < 0) continue;
 
-            thread([this, clientSocket]() {
+            requestPool->enqueue([this, clientSocket]() {
                 handleIncomingRequest(clientSocket);
                 close(clientSocket);
-            }).detach();
+            });
         }
 
         close(serverSocket);
     } 
-    //handles reuqest and returns output
-    void handleRequest(int clientSocket) {
-        char buffer[1024] = {0};
-       int  bytesRead = read(clientSocket, buffer, 1024);
-        if (bytesRead <= 0) return;
-        
-        string request(buffer);
-        istringstream iss(request);
-        string cmd, key, value;
-        
-        getline(iss, cmd, ':');
-        if (cmd == "GET") {
-            getline(iss, key);
-            string result = get(key);
-            send(clientSocket, result.c_str(), result.length(), 0);
-        } 
-        else if (cmd == "SET") {
-            getline(iss, key, ':');
-            getline(iss, value);
-            set(key, value);
-            const char* ack = "ACK";
-            send(clientSocket, ack, strlen(ack), 0);
-        }
-    }
-
-     bool tryConnect(const string& ip, int port) const {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) return false;
-
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
-        sockaddr_in peerAddr{};
-        peerAddr.sin_family = AF_INET;
-        peerAddr.sin_port = htons(port);
-        if (inet_pton(AF_INET, ip.c_str(), &peerAddr.sin_addr) <= 0) {
-            close(sock);
-            return false;
-        }
-
-        bool success = connect(sock, (struct sockaddr*)&peerAddr, sizeof(peerAddr)) >= 0;
-        close(sock);
-        return success;
-    }
 
 //maintains consistency accross nodes
 bool propagateUpdate(const string& peerIp, int peerPort, const string& key, const string& value,int version) {
@@ -763,8 +724,7 @@ public:
         auto start = chrono::high_resolution_clock::now();
 
         //create thread pool with hw threads
-        const int num_threads = thread::hardware_concurrency();
-        ThreadPool pool(num_threads);
+        ThreadPool pool(NUM_INIT_POOL);
         vector<future<void>> futures;
 
         nodes.resize(totalNodes);
@@ -772,7 +732,7 @@ public:
         mutex cout_mutex;
         for (int i = 0; i < totalNodes; i++) {
             futures.push_back(async(launch::async, [this, i, &cout_mutex]() {
-                nodes[i] = make_unique<Node>(8081 + i, 10, i, totalNodes);
+                nodes[i] = make_unique<Node>(8081 + i, CACHE_SIZE, i, totalNodes);
                 {
                     lock_guard<mutex> lock(cout_mutex);
                     cout << "Created node " << i << endl;
