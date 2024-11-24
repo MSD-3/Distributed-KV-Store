@@ -20,10 +20,10 @@
 #include <queue>
 
 //tuneables
-#define NUM_NODES 100
+#define NUM_NODES 10
 #define CACHE_SIZE 3000
 #define NUM_INIT_POOL 10
-#define NUM_REQUEST_POOL 16
+#define NUM_REQUEST_POOL 100
 
 #define DATA "organizations.csv"
 
@@ -492,7 +492,7 @@ bool redirectSet(const string& key, const string& value) {
             }
         }
         
-        cerr << "No peer found for node " << targetNode << endl;
+        //cerr << "No peer found for node " << targetNode << endl;
         return "";
     }
 
@@ -767,7 +767,12 @@ public:
         vector<promise<void>> data_promises(totalNodes);
         for (int i = 0; i < totalNodes; i++) {
             pool.enqueue([this, i, &data_promises]() {
+
+        #ifdef DATA
                 nodes[i]->loadFromCSV(DATA);
+        #else
+            nodes[i]->loadFromCSV("");
+        #endif
                 data_promises[i].set_value();
             });
         }
